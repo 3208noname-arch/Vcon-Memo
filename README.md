@@ -40,3 +40,9 @@ Vコン（ビデオコンテ）の下書きを、ブラウザだけで作れま�
 
 ページの実体は `index.html` の1枚です。
 サーバーも、ビルドも要りません。
+
+## ライセンス
+
+[PolyForm Noncommercial License 1.0.0](LICENSE.md)。**商用利用はできません。**個人の学習・研究・趣味での利用、改変、再配布は、ライセンスの条件の範囲でできます。
+
+Required Notice: Copyright 2026 Ponzu

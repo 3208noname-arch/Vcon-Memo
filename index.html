@@ -49,6 +49,7 @@ button:disabled { opacity: .4; cursor: default; }
 .newCard small { display: block; color: var(--sub); font-size: 12px; }
 .listHead { display: flex; align-items: center; justify-content: space-between; margin: 28px 0 8px; gap: 12px; flex-wrap: wrap; }
 .listHead h2 { margin: 0; font-size: 15px; color: var(--sub); font-weight: 600; }
+#projSync { font-size: 11px; font-weight: 400; margin-left: 8px; }
 #projList { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
 .proj {
   display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; padding: 12px 14px;
@@ -243,7 +244,7 @@ input[type=file] { display: none; }
       <span>新規プロジェクト<small>動画か音声を選びます。ファイルは端末の中のままで、どこにも送りません</small></span>
     </button>
     <div class="listHead">
-      <h2>最近のプロジェクト</h2>
+      <h2>最近のプロジェクト<span id="projSync" hidden></span></h2>
       <label class="sel">並び順
         <select id="selSort">
           <option value="date-desc">日付 新しい順</option>
@@ -1280,6 +1281,8 @@ async function handleFiles(files, handle, fromCopy) {
     try { applyData(JSON.parse(await json.text())); toast('メモを読み込みました'); }
     catch (err) { toast('JSONを読めませんでした: ' + err.message); }
   } else if (media) await restoreBest();
+  if (media && S.expect && Date.now() - S.expect.at < 180000 && S.expect.id !== projectId()) toast('選んだファイルは、名前かサイズが違うので、別のプロジェクトとして開きました');
+  S.expect = null;
   if (media) {
     registerProject();
     if (handle) idbPut(projectId(), handle).catch(() => { /* ハンドルを残せなくても開ける */ });
@@ -1287,7 +1290,14 @@ async function handleFiles(files, handle, fromCopy) {
   showView('editor');
   if (media && !fromCopy && S.keepFile) saveCopy(media);        // 開いたあとに、裏で残す（待たせない）
 }
+// 別のファイルへ移る前に、送れていない編集を、いまのうちに送る（そのまま移ると、送信待ちが取り消されるため）
+function flushPending() {
+  if (!SERVER || !S.dirty || !hasMedia()) return;
+  const url = serverUrl(), body = JSON.stringify(payload());
+  fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body, keepalive: body.length < 60000 }).catch(() => { /* 控えは端末に残る。次に開いた時に送る */ });
+}
 function openMedia(file) {
+  flushPending();
   return new Promise((resolve) => {
     if (mediaUrl) URL.revokeObjectURL(mediaUrl);
     mediaUrl = URL.createObjectURL(file);
@@ -1423,8 +1433,72 @@ function registerProject(extra) {
   const a = loadProjects(), id = projectId();
   let p = a.find((x) => x.id === id);
   if (!p) { p = { id, name: baseName(), createdAt: Date.now() }; a.push(p); }
-  Object.assign(p, { file: S.mediaName, size: S.mediaSize, duration: S.duration, memos: S.memos.length, updatedAt: S.savedAt || Date.now() }, extra || {});
+  Object.assign(p, { file: S.mediaName, size: S.mediaSize, duration: S.duration, memos: S.memos.length, updatedAt: S.savedAt || Date.now(), seen: true }, extra || {});
   saveProjects(a);
+  scheduleProjectsSync();
+}
+
+/* ---- プロジェクト一覧の、端末をまたいだ共有 ----
+   自宅のサーバー（SERVER が真の時だけ）の /data/vcon-memo/projects.json に、一覧を置く。
+   各端末は、開いた時・変えた時・ホームを開いた時に、サーバーの一覧と「合わせる」（足し合わせて、新しいほうを採る）。
+   端末ごとの項目（copy＝この端末に残したファイル、seen＝この端末で開いたことがある）は、共有しない。
+   動画や音声のファイルは、共有しない（各端末の中のまま）。他の端末で作ったものは、押すと、ファイルを選び直す。同じファイルなら、メモが出る。 */
+const REG_URL = '/data/vcon-memo/projects.json';
+const SHARED_KEYS = ['id', 'name', 'file', 'size', 'duration', 'memos', 'createdAt', 'updatedAt'];
+const DEL_KEEP_MS = 30 * 86400000;                      // 「消した」印は、30日残す（その間に、ほかの端末が同期すれば、消える）
+const pickKeys = (o, keys) => Object.fromEntries(keys.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
+const loadDeleted = () => { try { return JSON.parse(localStorage.getItem('vcon:projects-del') || '[]'); } catch (_) { return []; } };
+const saveDeleted = (a) => { try { localStorage.setItem('vcon:projects-del', JSON.stringify(a)); } catch (_) { /* 保存できなくても動く */ } };
+function mergeProjects(localList, localDel, remote) {
+  const now = Date.now(), del = new Map();
+  for (const d of [...localDel, ...(remote.deleted || [])]) if (d && d.id && now - d.deletedAt < DEL_KEEP_MS) del.set(d.id, Math.max(del.get(d.id) || 0, d.deletedAt));
+  const L = new Map(localList.map((p) => [p.id, p])), R = new Map((remote.projects || []).map((p) => [p.id, p]));
+  const list = [];
+  for (const id of new Set([...L.keys(), ...R.keys()])) {
+    const l = L.get(id), r = R.get(id);
+    const win = !l ? r : !r ? l : ((r.updatedAt || 0) > (l.updatedAt || 0) ? r : l);       // 新しいほうを採る
+    if ((del.get(id) || 0) > (win.updatedAt || 0)) continue;                                 // 消した印のほうが新しい → 一覧から外す
+    del.delete(id);                                                                          // 消したあとに作り直された → 印は捨てる
+    list.push({ ...(l ? pickKeys(l, ['copy', 'seen']) : { copy: 0, seen: false }), ...pickKeys(win, SHARED_KEYS) });
+  }
+  return { list, deleted: [...del].map(([id, deletedAt]) => ({ id, deletedAt })) };
+}
+const canonReg = (reg) => JSON.stringify({
+  p: (reg.projects || []).map((p) => pickKeys(p, SHARED_KEYS)).sort((a, b) => (a.id < b.id ? -1 : 1)),
+  d: (reg.deleted || []).map((d) => ({ id: d.id, deletedAt: d.deletedAt })).sort((a, b) => (a.id < b.id ? -1 : 1)),
+});
+function setProjSync(s) {
+  const el = $('projSync'); el.hidden = !SERVER;
+  el.textContent = { ok: '・ 他の端末と同期済み', sync: '・ 同期中…', off: '・ サーバーに接続できません（この端末の一覧だけ表示）' }[s] || '';
+}
+let regTimer, regBusy = false, regAgain = false;
+function scheduleProjectsSync(ms = 1500) { if (!SERVER) return; clearTimeout(regTimer); regTimer = setTimeout(syncProjects, ms); }
+async function syncProjects() {
+  if (!SERVER) return;
+  if (regBusy) { regAgain = true; return; }
+  regBusy = true; setProjSync('sync');
+  try {
+    let remote = { projects: [], deleted: [] };
+    const r = await fetch(REG_URL, { cache: 'no-store' });
+    if (r.ok) remote = await r.json(); else if (r.status !== 404) throw new Error('HTTP ' + r.status);
+    const before = loadProjects(), { list, deleted } = mergeProjects(before, loadDeleted(), remote);
+    const gone = before.filter((p) => !list.some((q) => q.id === p.id));                    // ほかの端末で消された
+    saveProjects(list); saveDeleted(deleted);
+    for (const p of gone) {                                                                  // この端末の控えと、残したファイルも消す（サーバーのメモは残す）
+      try { localStorage.removeItem('vcon:' + p.id); } catch (_) { /* なければよい */ }
+      idbDel(p.id).catch(() => { /* なければよい */ }); fileDel(p.id).catch(() => { /* なければよい */ });
+    }
+    const body = { app: 'vcon-memo', version: 1, savedAt: Date.now(), projects: list.map((p) => pickKeys(p, SHARED_KEYS)), deleted };
+    if (canonReg(body) !== canonReg(remote)) {
+      const w = await fetch(REG_URL, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (!w.ok) throw new Error('HTTP ' + w.status);
+    }
+    setProjSync('ok'); renderHome(); refreshStorageInfo();
+  } catch (_) {
+    setProjSync('off'); clearTimeout(regTimer); regTimer = setTimeout(syncProjects, 20000);   // つながるまで、20秒おきに再試行
+  } finally {
+    regBusy = false; if (regAgain) { regAgain = false; scheduleProjectsSync(300); }
+  }
 }
 function migrateProjects() {                 // 一覧ができる前に取った控えも、一覧に出す
   try {
@@ -1436,6 +1510,7 @@ function migrateProjects() {                 // 一覧ができる前に取っ�
       const d = JSON.parse(localStorage.getItem(k)), md = d.media || {};
       a.push({ id, name: (md.name || id.split('|')[0]).replace(/\.[^.]+$/, ''), file: md.name || id.split('|')[0], size: md.size || +id.split('|')[1] || 0, duration: md.duration || 0, memos: (d.memos || []).length, createdAt: d.savedAt || Date.now(), updatedAt: d.savedAt || Date.now() });
     }
+    a.forEach((p) => { if (p.seen === undefined) p.seen = true; });                // この端末にあるものは、この端末で開いたことがある
     saveProjects(a);
   } catch (_) { /* 壊れた控えは飛ばす */ }
 }
@@ -1511,7 +1586,7 @@ function renderHome() {
     const li = document.createElement('li'); li.className = 'proj'; li.tabIndex = 0;
     const n = document.createElement('div'); n.className = 'pn'; n.textContent = p.name || p.file; n.title = p.file;
     const m = document.createElement('div'); m.className = 'pm';
-    m.textContent = `${fmtDate(p.updatedAt || 0)} ・ メモ ${p.memos || 0}件 ・ ${p.duration ? fmtDur(p.duration) : '--'} ・ ${p.file}` + (p.copy ? ` ・ ファイル保存済み ${fmtSize(p.copy)}` : '');
+    m.textContent = `${fmtDate(p.updatedAt || 0)} ・ メモ ${p.memos || 0}件 ・ ${p.duration ? fmtDur(p.duration) : '--'} ・ ${p.file}` + (p.copy ? ` ・ ファイル保存済み ${fmtSize(p.copy)}` : (!p.seen ? ' ・ 他の端末で作成（押すと、ファイルを選びます）' : ''));
     const a = document.createElement('div'); a.className = 'pa';
     const rn = document.createElement('button'); rn.textContent = '名前'; rn.title = '名前を変える';
     const del = document.createElement('button'); del.textContent = '削除'; del.title = 'この端末の一覧と控えから消す';
@@ -1526,16 +1601,17 @@ function renderHome() {
 function renameProject(id) {
   const a = loadProjects(), p = a.find((x) => x.id === id); if (!p) return;
   const name = prompt('プロジェクトの名前', p.name || p.file);
-  if (name && name.trim()) { p.name = name.trim(); saveProjects(a); renderHome(); }
+  if (name && name.trim()) { p.name = name.trim(); p.updatedAt = Date.now(); saveProjects(a); renderHome(); scheduleProjectsSync(300); }
 }
 function deleteProject(id) {
   const p = loadProjects().find((x) => x.id === id); if (!p) return;
-  if (!confirm(`「${p.name || p.file}」を、この端末の一覧と控えから消します。` + (p.copy ? '\nこの端末のブラウザに残した動画・音声（' + fmtSize(p.copy) + '）も消えます。' : '') + '\n元のファイルは消えません。サーバーに保存したメモも残ります。')) return;
+  if (!confirm(`「${p.name || p.file}」を、一覧と、この端末の控えから消します。` + (SERVER ? '\n他の端末の一覧からも消えます（その端末に残した動画・音声も消えます）。' : '') + (p.copy ? '\nこの端末のブラウザに残した動画・音声（' + fmtSize(p.copy) + '）も消えます。' : '') + '\n元のファイルは消えません。サーバーに保存したメモも残ります。')) return;
   saveProjects(loadProjects().filter((x) => x.id !== id));
+  saveDeleted([...loadDeleted().filter((d) => d.id !== id), { id, deletedAt: Date.now() }]);   // ほかの端末へも伝える
   try { localStorage.removeItem('vcon:' + id); } catch (_) { /* なければよい */ }
   idbDel(id).catch(() => { /* なければよい */ });
   fileDel(id).catch(() => { /* なければよい */ });
-  renderHome(); refreshStorageInfo();
+  renderHome(); refreshStorageInfo(); scheduleProjectsSync(300);
 }
 const PICKER_TYPES = [{ description: '動画・音声', accept: { 'video/*': ['.mp4', '.m4v', '.mov', '.webm'], 'audio/*': ['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac'] } }];
 async function newProject() {
@@ -1560,6 +1636,7 @@ async function openProject(id) {
       if (perm === 'granted') { await handleFiles([await h.getFile()], h); return; }
     }
   } catch (_) { /* 参照が使えなければ、選び直し */ }
+  S.expect = { id, at: Date.now() };                                               // 選んだファイルが違った時に、知らせるため
   toast(`「${p.file}」を選んでください（このファイルが前回と同じなら、メモが出ます）`);   // 3. 選び直し
   $('fileInput').click();
 }
@@ -1573,6 +1650,7 @@ function showView(v) {
 }
 function goHome() {
   video.pause(); closeColorPop(); closeMore(); renderHome(); showView('home'); document.title = 'Vコンメモ';
+  syncProjects();                                           // ホームを開いたら、ほかの端末の一覧と合わせる
 }
 
 /* ================= ドラッグ&ドロップ ================= */
@@ -1591,6 +1669,11 @@ document.addEventListener('drop', async (e) => {
 /* ================= 起動 ================= */
 loadPrefs(); migrateProjects(); applyPrefsToUI(); renderHome();
 showView('home');
+if (SERVER) {                                               // 自宅のサーバーで開いた時だけ、一覧を共有する
+  syncProjects();
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && !$('home').hidden) syncProjects(); });
+  setInterval(() => { if (!document.hidden && !$('home').hidden) syncProjects(); }, 30000);
+}
 requestAnimationFrame(tick);
 </script>
 </body>
