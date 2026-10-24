@@ -221,6 +221,7 @@ dialog::backdrop { background: #000a; }
 #keysBox td { padding: 4px 6px; border-bottom: 1px solid var(--line); }
 #keysBox td:first-child { white-space: nowrap; color: var(--gap); }
 
+#xfer { position: fixed; left: 12px; bottom: 12px; z-index: 45; background: #000c; color: #cfe6ff; font-size: 12px; padding: 5px 10px; border-radius: 8px; pointer-events: none; max-width: calc(100vw - 24px); }
 #toast {
   position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: #000c; color: #fff; z-index: 50;
   padding: 8px 16px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: calc(100vw - 32px);
@@ -423,6 +424,10 @@ input[type=file] { display: none; }
       <label>端末に残したファイル<small id="storageInfo">確認中…</small></label>
       <button id="btnClearCopies">すべて消す</button>
     </div>
+    <div class="setRow" id="rowUpload" hidden>
+      <label for="chkUpload">動画・音声を、自宅のサーバーにも保存する<small>ほかの端末（スマホ・PC）で、選び直さずに開けます。初めて開く端末で、1回だけ、サーバーから取り込みます。LAN と Tailscale の中だけで、ほかの人は見られません。サーバーの容量を使います</small></label>
+      <input type="checkbox" id="chkUpload">
+    </div>
 
     <h3>ショートカット</h3>
     <details id="keysBox">
@@ -446,6 +451,26 @@ input[type=file] { display: none; }
   </div>
 </dialog>
 
+<!-- サーバーから取り込み中の画面 -->
+<dialog id="dlgBusy">
+  <div class="dlgBody" style="padding-top: 18px">
+    <p id="busyTitle" style="margin: 0 0 10px"></p>
+    <progress id="busyBar" value="0" max="1" style="width: 100%"></progress>
+    <p id="busyText" style="color: var(--sub); font-size: 12px; margin: 6px 0 12px"></p>
+    <button id="busyCancel">やめる</button>
+  </div>
+</dialog>
+<!-- ファイルを選んでもらう案内（iPhone・iPad では、押した直後でないと、選択画面が開かないため） -->
+<dialog id="dlgPick">
+  <div class="dlgBody" style="padding-top: 18px">
+    <p id="pickText" style="margin: 0 0 14px"></p>
+    <div style="display: flex; gap: 8px; justify-content: flex-end">
+      <button id="pickCancel">やめる</button>
+      <button id="pickGo" class="on">ファイルを選ぶ</button>
+    </div>
+  </div>
+</dialog>
+<div id="xfer" hidden></div>
 <input type="file" id="fileInput" multiple accept="video/*,audio/*,.mp4,.m4v,.mov,.webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.json">
 <div id="toast"></div>
 
@@ -465,6 +490,7 @@ const S = {
   memos: [],            // { id, t, strokes: [{ w, c, pts: [[x, y], ...] }] }（座標は0〜1の比）
   nextId: 1,
   mediaName: '', mediaSize: 0, duration: 0, audioOnly: false,
+  pid: '',              // いま開いているプロジェクトの識別（「ファイル名|サイズ」。結びつけた時は、元のプロジェクトのもの）
   aspect: 16 / 9,
   tool: 'pen', size: 'thin', hold: true,
   color: DEFAULT_COLOR, hsv: { h: 4, s: 0.81, v: 1 }, recent: [],
@@ -483,6 +509,7 @@ const S = {
   afterLast: 'play',    // 最後のメモから先: 'play' 普通に再生する / 'hold' 終わりまで静止のまま（静止がオンの時）
   afterLastSecs: 3,     // 普通に再生に戻るまでの秒数（最後のメモのコマを、この間だけ止める。0ならすぐ）
   keepFile: true,       // 選んだ動画・音声を、この端末のブラウザに残す（次から選び直さない）
+  uploadFile: true,     // 選んだ動画・音声を、自宅のサーバーにも置く（ほかの端末で、選び直さずに開ける。自宅のサーバーで開いた時だけ）
   display: 'next',      // メモの表示: 'next' 次のメモまで / 'frame' 書いたコマだけ / 'secs' 書いたコマから指定秒数
   displaySecs: 3,       // 'secs' の時に表示する秒数
   savedAt: 0,           // 最後に編集した時刻（ミリ秒）。ブラウザとサーバーの新旧の比べに使う
@@ -729,8 +756,9 @@ function eraseAt(memo, pt) {
 }
 
 // 手のひらや指の接触を、描画として扱わない（スタイラス対応のタブレットで、手を置いて描くため）
+function markPen() { if (!S.penSeen) { S.penSeen = true; savePrefs(); } }      // この端末で、ペンを使ったことを覚える（次から、最初の1回から、指を無視する）
 function palmIgnored(e) {
-  if (e.pointerType === 'pen') { S.penSeen = true; return false; }
+  if (e.pointerType === 'pen') { markPen(); return false; }
   if (e.pointerType !== 'touch') return false;
   if (S.inputMode === 'pen') return true;
   if (S.inputMode === 'auto' && S.penSeen) return true;
@@ -790,7 +818,7 @@ function eraseStep(pt) {
   render();
 }
 canvas.addEventListener('pointermove', (e) => {
-  if (e.pointerType === 'pen') S.penSeen = true;                   // ペンが近づいた（ホバー）だけでも、ペンありと判断する
+  if (e.pointerType === 'pen') markPen();                          // ペンが近づいた（ホバー）だけでも、ペンありと判断する
   if (!drawing || e.pointerId !== drawing.pid) return;
   drawing.last = performance.now();
   const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
@@ -1137,6 +1165,8 @@ function loadPrefs() {
     if (['play', 'hold'].includes(p.afterLast)) S.afterLast = p.afterLast;
     if (p.afterLastSecs >= 0 && p.afterLastSecs <= 600) S.afterLastSecs = +p.afterLastSecs;
     if (typeof p.keepFile === 'boolean') S.keepFile = p.keepFile;
+    if (typeof p.uploadFile === 'boolean') S.uploadFile = p.uploadFile;
+    if (p.penSeen === true) S.penSeen = true;                          // この端末で、ペンを使ったことがある（次から、最初の1回から、指を無視する）
     if (p.displaySecs >= 0.1 && p.displaySecs <= 600) S.displaySecs = +p.displaySecs;
     if (p.color && hexToRgb(p.color)) { S.color = toHex(hexToRgb(p.color)); S.hsv = rgb2hsv(...hexToRgb(S.color)); }
     if (Array.isArray(p.recent)) S.recent = p.recent.filter((c) => hexToRgb(c)).slice(0, 8);
@@ -1144,7 +1174,7 @@ function loadPrefs() {
 }
 function savePrefs() {
   try {
-    localStorage.setItem('vcon:prefs', JSON.stringify({ step: S.step, input: S.inputMode, opacity: S.opacity, palette: S.palette, format: S.colorFormat, sort: S.sort, hold: S.hold, display: S.display, displaySecs: S.displaySecs, afterLast: S.afterLast, afterLastSecs: S.afterLastSecs, keepFile: S.keepFile, color: S.color, recent: S.recent }));
+    localStorage.setItem('vcon:prefs', JSON.stringify({ step: S.step, input: S.inputMode, opacity: S.opacity, palette: S.palette, format: S.colorFormat, sort: S.sort, hold: S.hold, display: S.display, displaySecs: S.displaySecs, afterLast: S.afterLast, afterLastSecs: S.afterLastSecs, keepFile: S.keepFile, uploadFile: S.uploadFile, penSeen: S.penSeen, color: S.color, recent: S.recent }));
   } catch (_) { /* 保存できなくても動く */ }
 }
 function applyPrefsToUI() {
@@ -1152,7 +1182,7 @@ function applyPrefsToUI() {
   $('selPalette').value = S.palette; $('selFormat').value = S.colorFormat; $('selInput').value = S.inputMode; $('selSort').value = S.sort;
   $('selDisplay').value = S.display; $('numSecs').value = String(S.displaySecs); $('rowSecs').hidden = S.display !== 'secs';
   $('selAfterLast').value = S.afterLast; $('numAfterSecs').value = String(S.afterLastSecs); $('rowAfterSecs').hidden = S.afterLast !== 'play';
-  $('chkKeep').checked = S.keepFile;
+  $('chkKeep').checked = S.keepFile; $('chkUpload').checked = S.uploadFile; $('rowUpload').hidden = !SERVER;
   $('afterChips').querySelectorAll('button').forEach((b) => b.classList.toggle('on', +b.dataset.v === S.afterLastSecs));
   syncSteps(); paintColorUI(); syncButtons();
   $('stepChips').querySelectorAll('button').forEach((b) => b.classList.toggle('on', +b.dataset.v === S.step));
@@ -1181,6 +1211,7 @@ for (const v of [0, 1, 2, 3, 5, 10]) {
 $('selAfterLast').onchange = (e) => { S.afterLast = e.target.value; applyPrefsToUI(); savePrefs(); updateHold(); };
 $('numAfterSecs').onchange = (e) => { const x = +e.target.value; if (e.target.value !== '' && x >= 0) S.afterLastSecs = Math.round(clamp(x, 0, 600) * 10) / 10; applyPrefsToUI(); savePrefs(); updateHold(); };
 $('chkKeep').onchange = (e) => { S.keepFile = e.target.checked; savePrefs(); };
+$('chkUpload').onchange = (e) => { S.uploadFile = e.target.checked; savePrefs(); };
 $('btnClearCopies').onclick = clearAllCopies;
 $('selDisplay').onchange =(e) => { S.display = e.target.value; applyPrefsToUI(); savePrefs(); redrawMemo(); };
 $('numSecs').onchange = (e) => { const x = +e.target.value; if (x > 0) S.displaySecs = Math.round(clamp(x, 0.1, 600) * 10) / 10; applyPrefsToUI(); savePrefs(); redrawMemo(); };
@@ -1264,31 +1295,53 @@ document.addEventListener('keydown', (e) => {
 /* ================= ファイル ================= */
 const MEDIA_EXT = /\.(mp4|m4v|mov|webm|mp3|wav|m4a|aac|ogg|flac)$/i;
 let mediaUrl = null;
-const projectId = () => `${S.mediaName}|${S.mediaSize}`;
-const mediaKey = () => `vcon:${projectId()}`;
+// プロジェクトの識別（S.pid）: 既定は「ファイル名|サイズ」。メモの控え・サーバーのメモ・残したファイルは、すべてこれを鍵にする。
+// 実際に開いているファイルの名前・サイズ（S.mediaName・S.mediaSize）とは、別に持つ（一覧から選んで開いた時は、名前やサイズが違っても、そのプロジェクトに結びつけるため）
+const projectId = () => S.pid;
+const mediaKey = () => `vcon:${S.pid}`;
 const baseName = () => S.mediaName.replace(/\.[^.]+$/, '');
+const nameOfPid = (pid) => pid.slice(0, pid.lastIndexOf('|'));
+const sizeOfPid = (pid) => +pid.slice(pid.lastIndexOf('|') + 1) || 0;
+// どのプロジェクトのファイルとして開くかを決める
+function decidePid(file, forcePid) {
+  if (forcePid) return forcePid;
+  const list = loadProjects(), exact = `${file.name}|${file.size}`;
+  if (list.some((p) => p.id === exact)) return exact;                                          // 完全に同じ
+  const ci = list.find((p) => p.id.toLowerCase() === exact.toLowerCase());                     // 大文字・小文字だけ違う（スマホの「.MP4」と、PCの「.mp4」など）
+  if (ci) return ci.id;
+  const ex = S.expect && Date.now() - S.expect.at < 180000 ? S.expect : null;                  // 一覧から選んで開こうとしている → そのプロジェクトのファイルとして結びつける
+  if (ex && list.some((p) => p.id === ex.id)) return ex.id;
+  return exact;
+}
 
-async function handleFiles(files, handle, fromCopy) {
+async function handleFiles(files, handle, fromCopy, forcePid) {
   const media = files.find((f) => /^(video|audio)\//.test(f.type) || MEDIA_EXT.test(f.name));
   const json = files.find((f) => /\.json$/i.test(f.name));
   if (!media && !json) { toast('動画・音声・JSONのいずれかを選んでください'); return; }
   if (!media && !hasMedia()) { toast('JSONだけでは開けません。動画か音声も一緒に選んでください'); return; }
+  let bound = null;
   if (media) {
-    await openMedia(media);
+    const pid = decidePid(media, forcePid);
+    if (pid !== `${media.name}|${media.size}`) bound = pid;                                    // 名前かサイズが違うが、結びつけた
+    await openMedia(media, pid);
     if (!hasMedia()) return;
   }
   if (json) {
     try { applyData(JSON.parse(await json.text())); toast('メモを読み込みました'); }
     catch (err) { toast('JSONを読めませんでした: ' + err.message); }
   } else if (media) await restoreBest();
-  if (media && S.expect && Date.now() - S.expect.at < 180000 && S.expect.id !== projectId()) toast('選んだファイルは、名前かサイズが違うので、別のプロジェクトとして開きました');
   S.expect = null;
   if (media) {
     registerProject();
     if (handle) idbPut(projectId(), handle).catch(() => { /* ハンドルを残せなくても開ける */ });
+    const p = loadProjects().find((x) => x.id === S.pid);
+    if (bound && p && p.duration && Math.abs(p.duration - S.duration) > 2) {                   // 長さが大きく違う → 別の動画かもしれない
+      toast(`選んだファイルの長さ（${fmtDur(S.duration)}）が、元の動画（${fmtDur(p.duration)}）と違います。別の動画なら、メモの位置はずれます`);
+    }
   }
   showView('editor');
-  if (media && !fromCopy && S.keepFile) saveCopy(media);        // 開いたあとに、裏で残す（待たせない）
+  if (media && !fromCopy && S.keepFile) saveCopy(media, S.pid);        // 開いたあとに、裏で残す（待たせない）
+  if (media && !fromCopy) uploadMedia(media, S.pid);                  // サーバーにも置く（まだ無ければ）
 }
 // 別のファイルへ移る前に、送れていない編集を、いまのうちに送る（そのまま移ると、送信待ちが取り消されるため）
 function flushPending() {
@@ -1296,12 +1349,12 @@ function flushPending() {
   const url = serverUrl(), body = JSON.stringify(payload());
   fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body, keepalive: body.length < 60000 }).catch(() => { /* 控えは端末に残る。次に開いた時に送る */ });
 }
-function openMedia(file) {
+function openMedia(file, pid) {
   flushPending();
   return new Promise((resolve) => {
     if (mediaUrl) URL.revokeObjectURL(mediaUrl);
     mediaUrl = URL.createObjectURL(file);
-    S.mediaName = file.name; S.mediaSize = file.size; S.handle = null;
+    S.mediaName = file.name; S.mediaSize = file.size; S.handle = null; S.pid = pid || `${file.name}|${file.size}`;
     S.memos = []; S.nextId = 1; S.undo = []; S.redo = []; S.duration = 0;
     S.savedAt = 0; S.dirty = false; clearTimeout(syncTimer);    // 前のファイルの送信待ちを、新しいファイルへ持ち越さない
     frames.clear(); framePending.clear(); holdId = null; hold.style.display = 'none'; holdOn = false;
@@ -1323,7 +1376,7 @@ function openMedia(file) {
 
 /* ================= 保存・復元 ================= */
 function payload() {
-  return { app: 'vcon-memo', version: 1, savedAt: S.savedAt, media: { name: S.mediaName, size: S.mediaSize, duration: S.duration }, memos: sorted(), nextId: S.nextId };
+  return { app: 'vcon-memo', version: 1, savedAt: S.savedAt, pid: S.pid, media: { name: S.mediaName, size: S.mediaSize, duration: S.duration }, memos: sorted(), nextId: S.nextId };
 }
 // quiet=true: 保存済みのデータを読み込むだけ（保存時刻を変えず、サーバーにも送らない）
 function applyData(d, quiet) {
@@ -1343,7 +1396,8 @@ function applyData(d, quiet) {
 const PRIVATE_HOST = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|.+\.ts\.net$|.+\.local$)/.test(location.hostname);
 const SERVER = location.protocol.startsWith('http') && PRIVATE_HOST;
 const fnv = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); } return (h >>> 0).toString(16).padStart(8, '0'); };
-const serverUrl = () => '/data/vcon-memo/' + (baseName().replace(/[^A-Za-z0-9_-]+/g, '').slice(0, 24) || 'media') + '-' + fnv(S.mediaName + '|' + S.mediaSize) + '.json';
+const slugOfPid = (pid) => (nameOfPid(pid).replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9_-]+/g, '').slice(0, 24) || 'media');
+const serverUrl = () => '/data/vcon-memo/' + slugOfPid(S.pid) + '-' + fnv(S.pid) + '.json';       // 既存のプロジェクトでは、これまでと同じ名前になる
 const SYNC_TEXT = { ok: '同期: 保存済み', dirty: '同期: 送信待ち', sending: '同期: 送信中…', checking: '同期: 確認中…', offline: '同期: 接続できません', pending: '同期: 未送信（接続できません）' };
 function setSync(state) {
   const b = $('btnSync'); b.hidden = !SERVER || !hasMedia();
@@ -1432,8 +1486,8 @@ function registerProject(extra) {
   if (!hasMedia()) return;
   const a = loadProjects(), id = projectId();
   let p = a.find((x) => x.id === id);
-  if (!p) { p = { id, name: baseName(), createdAt: Date.now() }; a.push(p); }
-  Object.assign(p, { file: S.mediaName, size: S.mediaSize, duration: S.duration, memos: S.memos.length, updatedAt: S.savedAt || Date.now(), seen: true }, extra || {});
+  if (!p) { p = { id, name: nameOfPid(id).replace(/\.[^.]+$/, ''), file: nameOfPid(id), size: sizeOfPid(id), createdAt: Date.now() }; a.push(p); }
+  Object.assign(p, { duration: S.duration, memos: S.memos.length, updatedAt: S.savedAt || Date.now(), seen: true }, extra || {});
   saveProjects(a);
   scheduleProjectsSync();
 }
@@ -1444,7 +1498,7 @@ function registerProject(extra) {
    端末ごとの項目（copy＝この端末に残したファイル、seen＝この端末で開いたことがある）は、共有しない。
    動画や音声のファイルは、共有しない（各端末の中のまま）。他の端末で作ったものは、押すと、ファイルを選び直す。同じファイルなら、メモが出る。 */
 const REG_URL = '/data/vcon-memo/projects.json';
-const SHARED_KEYS = ['id', 'name', 'file', 'size', 'duration', 'memos', 'createdAt', 'updatedAt'];
+const SHARED_KEYS = ['id', 'name', 'file', 'size', 'duration', 'memos', 'createdAt', 'updatedAt', 'media'];   // media＝サーバーに置いた動画・音声（path・size・at）
 const DEL_KEEP_MS = 30 * 86400000;                      // 「消した」印は、30日残す（その間に、ほかの端末が同期すれば、消える）
 const pickKeys = (o, keys) => Object.fromEntries(keys.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
 const loadDeleted = () => { try { return JSON.parse(localStorage.getItem('vcon:projects-del') || '[]'); } catch (_) { return []; } };
@@ -1459,7 +1513,10 @@ function mergeProjects(localList, localDel, remote) {
     const win = !l ? r : !r ? l : ((r.updatedAt || 0) > (l.updatedAt || 0) ? r : l);       // 新しいほうを採る
     if ((del.get(id) || 0) > (win.updatedAt || 0)) continue;                                 // 消した印のほうが新しい → 一覧から外す
     del.delete(id);                                                                          // 消したあとに作り直された → 印は捨てる
-    list.push({ ...(l ? pickKeys(l, ['copy', 'seen']) : { copy: 0, seen: false }), ...pickKeys(win, SHARED_KEYS) });
+    const out = { ...(l ? pickKeys(l, ['copy', 'seen']) : { copy: 0, seen: false }), ...pickKeys(win, SHARED_KEYS) };
+    const ms = [l && l.media, r && r.media].filter(Boolean).sort((a, b) => (b.at || 0) - (a.at || 0));   // サーバーの動画は、更新日時と別に、新しいほうを採る
+    if (ms[0]) out.media = ms[0]; else delete out.media;
+    list.push(out);
   }
   return { list, deleted: [...del].map(([id, deletedAt]) => ({ id, deletedAt })) };
 }
@@ -1515,11 +1572,13 @@ function migrateProjects() {                 // 一覧ができる前に取っ�
   } catch (_) { /* 壊れた控えは飛ばす */ }
 }
 // IndexedDB: 'handles'＝ファイルへの参照（Chrome・Edge）、'files'＝動画・音声そのもの（この端末のブラウザの中。外へは出ない）
-const idb = () => new Promise((res, rej) => {
+let idbPromise = null;                                       // 接続は1本を使い回す（操作のたびに開いて、開きっぱなしにしない）
+const idb = () => idbPromise || (idbPromise = new Promise((res, rej) => {
   const r = indexedDB.open('vcon-memo', 2);
   r.onupgradeneeded = () => { for (const n of ['handles', 'files']) if (!r.result.objectStoreNames.contains(n)) r.result.createObjectStore(n); };
-  r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
-});
+  r.onsuccess = () => { r.result.onversionchange = () => { r.result.close(); idbPromise = null; }; res(r.result); };   // 別のタブが作り直す時は、閉じて譲る
+  r.onerror = () => { idbPromise = null; rej(r.error); };
+}));
 const idbRun = async (store, mode, fn) => { const db = await idb(); return new Promise((res, rej) => { const t = db.transaction(store, mode), r = fn(t.objectStore(store)); t.oncomplete = () => res(r && r.result); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error('保存が中断されました')); }); };
 const idbPut = (k, v) => idbRun('handles', 'readwrite', (s) => s.put(v, k));
 const idbGet = (k) => idbRun('handles', 'readonly', (s) => s.get(k));
@@ -1534,8 +1593,8 @@ function updateProject(id, patch) {
   if (p) { Object.assign(p, patch); saveProjects(a); }
 }
 // 動画・音声を、この端末のブラウザに残す。次から、一覧を押すだけで開ける
-async function saveCopy(file) {
-  const id = `${file.name}|${file.size}`;
+async function saveCopy(file, id) {
+  id = id || `${file.name}|${file.size}`;
   try {
     const p = loadProjects().find((x) => x.id === id);
     if (p && p.copy) return;                                           // もう残してある
@@ -1545,7 +1604,7 @@ async function saveCopy(file) {
     }
     toast('動画・音声を、この端末のブラウザに残しています…');
     try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch (_) { /* 消されにくくする申請。通らなくてもよい */ }
-    await filePut(id, { file, name: file.name, size: file.size, type: file.type, at: Date.now() });
+    await filePut(id, { file, name: file.name, size: file.size, type: file.type, at: Date.now(), pid: id });
     updateProject(id, { copy: file.size });
     toast(`ファイルをこの端末に残しました（${fmtSize(file.size)}）。次から、選び直さずに開けます`);
     renderHome(); refreshStorageInfo();
@@ -1586,7 +1645,8 @@ function renderHome() {
     const li = document.createElement('li'); li.className = 'proj'; li.tabIndex = 0;
     const n = document.createElement('div'); n.className = 'pn'; n.textContent = p.name || p.file; n.title = p.file;
     const m = document.createElement('div'); m.className = 'pm';
-    m.textContent = `${fmtDate(p.updatedAt || 0)} ・ メモ ${p.memos || 0}件 ・ ${p.duration ? fmtDur(p.duration) : '--'} ・ ${p.file}` + (p.copy ? ` ・ ファイル保存済み ${fmtSize(p.copy)}` : (!p.seen ? ' ・ 他の端末で作成（押すと、ファイルを選びます）' : ''));
+    m.textContent = `${fmtDate(p.updatedAt || 0)} ・ メモ ${p.memos || 0}件 ・ ${p.duration ? fmtDur(p.duration) : '--'} ・ ${p.file}` + (p.copy ? ` ・ この端末に保存済み ${fmtSize(p.copy)}` : (!p.seen ? (p.media ? ' ・ 他の端末で作成（押すと、サーバーから取り込みます）' : ' ・ 他の端末で作成（押すと、ファイルを選びます）') : ''))
+      + (uploads.has(p.id) ? ` ・ サーバーへ送信中 ${Math.round(uploads.get(p.id).loaded / uploads.get(p.id).total * 100)}%` : (p.media ? ` ・ サーバーに保存済み ${fmtSize(p.media.size)}` : ''));
     const a = document.createElement('div'); a.className = 'pa';
     const rn = document.createElement('button'); rn.textContent = '名前'; rn.title = '名前を変える';
     const del = document.createElement('button'); del.textContent = '削除'; del.title = 'この端末の一覧と控えから消す';
@@ -1605,15 +1665,93 @@ function renameProject(id) {
 }
 function deleteProject(id) {
   const p = loadProjects().find((x) => x.id === id); if (!p) return;
-  if (!confirm(`「${p.name || p.file}」を、一覧と、この端末の控えから消します。` + (SERVER ? '\n他の端末の一覧からも消えます（その端末に残した動画・音声も消えます）。' : '') + (p.copy ? '\nこの端末のブラウザに残した動画・音声（' + fmtSize(p.copy) + '）も消えます。' : '') + '\n元のファイルは消えません。サーバーに保存したメモも残ります。')) return;
+  if (!confirm(`「${p.name || p.file}」を、一覧と、この端末の控えから消します。` + (SERVER ? '\n他の端末の一覧からも消えます（その端末に残した動画・音声も消えます）。' : '') + (SERVER && p.media ? '\nサーバーに置いた動画・音声（' + fmtSize(p.media.size) + '）も消えます。' : '') + (p.copy ? '\nこの端末のブラウザに残した動画・音声（' + fmtSize(p.copy) + '）も消えます。' : '') + '\n元のファイルは消えません。サーバーに保存したメモも残ります。')) return;
   saveProjects(loadProjects().filter((x) => x.id !== id));
   saveDeleted([...loadDeleted().filter((d) => d.id !== id), { id, deletedAt: Date.now() }]);   // ほかの端末へも伝える
+  if (uploads.has(id)) uploads.get(id).xhr.abort();                                           // 送信中なら、止める
+  if (SERVER && p.media) fetch(MEDIA_DIR + p.media.path, { method: 'DELETE' }).catch(() => { /* 消せなくても、一覧からは消える */ });   // サーバーの動画・音声も消す
   try { localStorage.removeItem('vcon:' + id); } catch (_) { /* なければよい */ }
   idbDel(id).catch(() => { /* なければよい */ });
   fileDel(id).catch(() => { /* なければよい */ });
   renderHome(); refreshStorageInfo(); scheduleProjectsSync(300);
 }
-const PICKER_TYPES = [{ description: '動画・音声', accept: { 'video/*': ['.mp4', '.m4v', '.mov', '.webm'], 'audio/*': ['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac'] } }];
+/* ---- 動画・音声を、自宅のサーバーにも置く ----
+   選んだ時に、裏でサーバーへ送る（まだ無ければ）。ほかの端末では、初めて開く時に1回だけ、サーバーから落として、この端末のブラウザに残す。
+   落としたあとの再生は、すべてこの端末の中。通信は使わない。メモの書き込みも同じ。
+   サーバーの置き場は /data/vcon-memo/media/。LAN と Tailscale の中だけで、ユーザー以外は見られない。 */
+const MEDIA_DIR = '/data/vcon-memo/media/';
+const MAX_UPLOAD = 6 * 1073741824;                    // サーバーの受け入れ上限（8GB）より小さくしておく
+const extOfName = (name) => (name.match(/\.[A-Za-z0-9]{1,5}$/) || [''])[0].toLowerCase();
+const mediaPathFor = (pid) => fnv(pid) + '-' + slugOfPid(pid) + extOfName(nameOfPid(pid));
+const uploads = new Map();                            // pid → { loaded, total, xhr, name }
+function renderXfer() {
+  const el = $('xfer'); const list = [...uploads.values()];
+  el.hidden = !list.length;
+  el.textContent = list.map((u) => `サーバーへ送信中: ${u.name} ${Math.round(u.loaded / u.total * 100)}%`).join(' / ');
+}
+function uploadMedia(file, pid) {
+  if (!SERVER || !S.uploadFile || !pid) return;
+  const p = loadProjects().find((x) => x.id === pid);
+  if (!p || p.media || uploads.has(pid)) return;                                  // もうサーバーにある、または送信中
+  if (file.size > MAX_UPLOAD) { toast('大きすぎるため、サーバーには置けませんでした（この端末の中だけで使えます）'); return; }
+  const path = mediaPathFor(pid), xhr = new XMLHttpRequest();
+  const u = { loaded: 0, total: file.size || 1, xhr, name: p.name || p.file };
+  uploads.set(pid, u);
+  xhr.open('PUT', MEDIA_DIR + path);
+  xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+  xhr.upload.onprogress = (e) => { u.loaded = e.loaded; u.total = e.total || u.total; renderXfer(); };
+  const done = (ok, why) => {
+    uploads.delete(pid); renderXfer();
+    if (ok) {
+      updateProject(pid, { media: { path, size: file.size, at: Date.now() } }); scheduleProjectsSync(300);
+      toast('動画・音声を、サーバーにも保存しました。ほかの端末でも、選び直さずに開けます');
+    } else if (why !== 'abort') toast('サーバーへ送れませんでした（' + why + '）。この端末の中だけで使えます');
+    renderHome(); refreshStorageInfo();
+  };
+  xhr.onload = () => done(xhr.status >= 200 && xhr.status < 300, 'HTTP ' + xhr.status);
+  xhr.onerror = () => done(false, '接続できません');
+  xhr.onabort = () => done(false, 'abort');
+  xhr.send(file);
+  renderXfer(); renderHome();
+  toast('動画・音声を、サーバーにも保存しています…（ほかの端末で、選び直さずに開けるようにします）');
+}
+const dlgBusy = $('dlgBusy');
+let busyCtl = null;
+function showBusy(title) {
+  $('busyTitle').textContent = title; $('busyBar').value = 0; $('busyText').textContent = '';
+  if (!dlgBusy.open) dlgBusy.showModal();
+}
+function setBusy(got, total) {
+  $('busyBar').max = total || 1; $('busyBar').value = got;
+  $('busyText').textContent = `${fmtSize(got)} / ${fmtSize(total)}（${Math.round(got / (total || 1) * 100)}%）`;
+}
+function hideBusy() { if (dlgBusy.open) dlgBusy.close(); busyCtl = null; }
+$('busyCancel').onclick = () => { if (busyCtl) busyCtl.abort(); };
+dlgBusy.addEventListener('cancel', (e) => { e.preventDefault(); if (busyCtl) busyCtl.abort(); });   // Esc でも、取り込みをやめる
+// サーバーから動画・音声を落とす（進み具合を出す）。落とした後は、端末の中のファイルとして使う
+async function downloadMedia(p) {
+  busyCtl = new AbortController();
+  showBusy(`「${p.name || p.file}」を、サーバーから取り込んでいます（初回だけです）`);
+  try {
+    const r = await fetch(MEDIA_DIR + p.media.path, { signal: busyCtl.signal });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const total = +r.headers.get('content-length') || p.media.size;
+    const reader = r.body.getReader(), chunks = []; let got = 0;
+    for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); got += value.length; setBusy(got, total); }
+    const type = r.headers.get('content-type') || '';
+    return new File(chunks, p.file, { type: /^(video|audio)\//.test(type) ? type : '' });
+  } finally { hideBusy(); }
+}
+// ファイル選択の案内。iPhone・iPad では、選択画面は、「押した直後」でないと開かないため、必ず、この画面のボタンから開く
+const dlgPick = $('dlgPick');
+function askForFile(p) {
+  S.expect = { id: p.id, at: Date.now() };                                          // 選んだファイルを、このプロジェクトに結びつける
+  $('pickText').textContent = `「${p.name || p.file}」の動画か音声ファイルを選んでください。名前やサイズが違っても、このプロジェクトのファイルとして使います（元の長さは ${p.duration ? fmtDur(p.duration) : '不明'}）。`;
+  if (!dlgPick.open) dlgPick.showModal();
+}
+$('pickGo').onclick = () => { dlgPick.close(); $('fileInput').click(); };           // ボタンを押した、その場で開く
+$('pickCancel').onclick = () => { S.expect = null; dlgPick.close(); };
+const PICKER_TYPES =[{ description: '動画・音声', accept: { 'video/*': ['.mp4', '.m4v', '.mov', '.webm'], 'audio/*': ['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac'] } }];
 async function newProject() {
   if (window.showOpenFilePicker) {
     try { const [h] = await window.showOpenFilePicker({ types: PICKER_TYPES }); await handleFiles([await h.getFile()], h); }
@@ -1625,7 +1763,7 @@ async function openProject(id) {
   if (hasMedia() && projectId() === id) { showView('editor'); return; }          // いま開いているものは、そのまま続きから
   try {                                                                            // 1. この端末に残したファイル（選び直し不要）
     const rec = p.copy ? await fileGet(id) : null;
-    if (rec && rec.file) { await handleFiles([rec.file], undefined, true); return; }
+    if (rec && rec.file) { await handleFiles([rec.file], undefined, true, id); return; }
     if (p.copy) { updateProject(id, { copy: 0 }); renderHome(); }                  // 残したはずが無い（ブラウザに消された）
   } catch (_) { /* 読めなければ、次の方法へ */ }
   try {                                                                            // 2. ファイルへの参照（Chrome・Edge）
@@ -1633,12 +1771,14 @@ async function openProject(id) {
     if (h) {
       let perm = await h.queryPermission({ mode: 'read' });
       if (perm !== 'granted') perm = await h.requestPermission({ mode: 'read' });
-      if (perm === 'granted') { await handleFiles([await h.getFile()], h); return; }
+      if (perm === 'granted') { await handleFiles([await h.getFile()], h, false, id); return; }
     }
-  } catch (_) { /* 参照が使えなければ、選び直し */ }
-  S.expect = { id, at: Date.now() };                                               // 選んだファイルが違った時に、知らせるため
-  toast(`「${p.file}」を選んでください（このファイルが前回と同じなら、メモが出ます）`);   // 3. 選び直し
-  $('fileInput').click();
+  } catch (_) { /* 参照が使えなければ、次の方法へ */ }
+  if (SERVER && p.media) {                                                         // 3. サーバーにある動画・音声を、初回だけ落とす
+    try { const f = await downloadMedia(p); await handleFiles([f], undefined, false, id); return; }
+    catch (err) { if (err.name !== 'AbortError') toast('サーバーから取り込めませんでした: ' + (err.message || err.name) + '。ファイルを選んでください'); else return; }
+  }
+  askForFile(p);                                                                   // 4. ファイルを選んでもらう（案内の画面から）
 }
 $('btnNewProject').onclick = newProject;
 $('selSort').onchange = (e) => { S.sort = e.target.value; savePrefs(); renderHome(); };
