@@ -221,6 +221,7 @@ dialog::backdrop { background: #000a; }
 #keysBox td { padding: 4px 6px; border-bottom: 1px solid var(--line); }
 #keysBox td:first-child { white-space: nowrap; color: var(--gap); }
 
+#pickText { white-space: pre-line; }
 #xfer { position: fixed; left: 12px; bottom: 12px; z-index: 45; background: #000c; color: #cfe6ff; font-size: 12px; padding: 5px 10px; border-radius: 8px; pointer-events: none; max-width: calc(100vw - 24px); }
 #toast {
   position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: #000c; color: #fff; z-index: 50;
@@ -1341,7 +1342,7 @@ async function handleFiles(files, handle, fromCopy, forcePid) {
   }
   showView('editor');
   if (media && !fromCopy && S.keepFile) saveCopy(media, S.pid);        // 開いたあとに、裏で残す（待たせない）
-  if (media && !fromCopy) uploadMedia(media, S.pid);                  // サーバーにも置く（まだ無ければ）
+  if (media) uploadMedia(media, S.pid);                               // サーバーにも置く（まだ無ければ。端末に残したファイルで開いた時も）
 }
 // 別のファイルへ移る前に、送れていない編集を、いまのうちに送る（そのまま移ると、送信待ちが取り消されるため）
 function flushPending() {
@@ -1551,6 +1552,7 @@ async function syncProjects() {
       if (!w.ok) throw new Error('HTTP ' + w.status);
     }
     setProjSync('ok'); renderHome(); refreshStorageInfo();
+    uploadMissingMedia();                                                                    // 端末にある動画で、サーバーに無いものを、送る
   } catch (_) {
     setProjSync('off'); clearTimeout(regTimer); regTimer = setTimeout(syncProjects, 20000);   // つながるまで、20秒おきに再試行
   } finally {
@@ -1715,6 +1717,23 @@ function uploadMedia(file, pid) {
   renderXfer(); renderHome();
   toast('動画・音声を、サーバーにも保存しています…（ほかの端末で、選び直さずに開けるようにします）');
 }
+// 端末に残してあるのに、サーバーに無い動画・音声を、ホームを開いた時に、自動で送る（1本ずつ。以前に開いたものも、開き直さなくてよい）
+const uploadTried = new Set();                        // 1回の起動で、1本につき、1回だけ試す（失敗を、くり返さない）
+let uploadingAll = false;
+async function uploadMissingMedia() {
+  if (!SERVER || !S.uploadFile || uploadingAll) return;
+  uploadingAll = true;
+  try {
+    for (const p of loadProjects()) {
+      if (!p.copy || p.media || uploads.has(p.id) || uploadTried.has(p.id)) continue;
+      uploadTried.add(p.id);
+      let rec = null; try { rec = await fileGet(p.id); } catch (_) { /* 読めなければ、飛ばす */ }
+      if (!rec || !rec.file) continue;
+      uploadMedia(rec.file, p.id);
+      while (uploads.has(p.id)) await new Promise((r) => setTimeout(r, 400));
+    }
+  } finally { uploadingAll = false; }
+}
 const dlgBusy = $('dlgBusy');
 let busyCtl = null;
 function showBusy(title) {
@@ -1746,7 +1765,8 @@ async function downloadMedia(p) {
 const dlgPick = $('dlgPick');
 function askForFile(p) {
   S.expect = { id: p.id, at: Date.now() };                                          // 選んだファイルを、このプロジェクトに結びつける
-  $('pickText').textContent = `「${p.name || p.file}」の動画か音声ファイルを選んでください。名前やサイズが違っても、このプロジェクトのファイルとして使います（元の長さは ${p.duration ? fmtDur(p.duration) : '不明'}）。`;
+  $('pickText').textContent = `「${p.name || p.file}」の動画か音声ファイルを選んでください。名前やサイズが違っても、このプロジェクトのファイルとして使います（元の長さは ${p.duration ? fmtDur(p.duration) : '不明'}）。`
+    + (SERVER ? '\n\nサーバーにも、この端末にも、まだ動画がありません。動画のある端末（PC など）でこのアプリのホームを開くと、自動でサーバーへ送られます。送られたあとは、ここを押すだけで、取り込まれます。' : '');
   if (!dlgPick.open) dlgPick.showModal();
 }
 $('pickGo').onclick = () => { dlgPick.close(); $('fileInput').click(); };           // ボタンを押した、その場で開く
