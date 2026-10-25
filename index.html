@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <!-- ホーム画面に追加した時に、Safari の枠なしで開く。iOS 17 以前は下の meta が、新しい iOS は manifest の display: standalone が要る -->
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -34,7 +34,12 @@ body {
   overflow: hidden;
   /* 枠なしで開いた時の、ノッチ・ステータスバー・ホームバーとの重なりを避ける（普通のタブでは 0） */
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  /* 拡大（つまむ・ダブルタップ）と、文字の選択・長押しメニューを止める。なぞってスクロールはできる */
+  touch-action: manipulation;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent;
 }
+input, textarea { user-select: text; -webkit-user-select: text; }   /* iOS は、選択を止めると、入力欄に文字が打てなくなるため、入力欄だけ戻す */
 button, select, input[type=number], input[type=text] {
   font: inherit; color: var(--text); background: var(--panel);
   border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px;
@@ -531,6 +536,10 @@ const S = {
 const $ = (id) => document.getElementById(id);
 const video = $('video'), canvas = $('canvas'), ctx = canvas.getContext('2d');
 const hold = $('hold'), holdCtx = hold.getContext('2d');
+// 拡大を止める。iOS の Safari は、viewport の指定を無視してつまみ拡大するので、専用のイベントも止める
+['gesturestart', 'gesturechange', 'gestureend'].forEach((n) => document.addEventListener(n, (e) => e.preventDefault(), { passive: false }));
+document.addEventListener('touchmove', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
+document.addEventListener('wheel', (e) => { if (e.ctrlKey) e.preventDefault(); }, { passive: false });   // トラックパッドのつまみ拡大
 const stage = $('stage'), wrap = $('stageWrap');
 
 /* ================= 小物 ================= */
