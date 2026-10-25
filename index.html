@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<!-- ホーム画面に追加した時に、Safari の枠なしで開く（iOS 17 以前は、この meta が要る） -->
+<!-- ホーム画面に追加した時に、Safari の枠なしで開く。iOS 17 以前は下の meta が、新しい iOS は manifest の display: standalone が要る -->
+<link rel="manifest" href="manifest.webmanifest">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
