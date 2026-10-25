@@ -117,7 +117,9 @@ button:disabled { opacity: .4; cursor: default; }
 #colorDot { width: 18px; height: 18px; border-radius: 50%; border: 2px solid #fff8; background: #ff3b30; display: inline-block; }
 
 #stageWrap { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 12px 16px; }
-#stage { position: relative; background: #000; width: 640px; height: 360px; }
+#stage { position: relative; background: #000; width: 640px; height: 360px; overflow: hidden; }
+#zoom { position: absolute; inset: 0; transform-origin: 0 0; }   /* 拡大するのは、動画・静止したコマ・メモの層だけ */
+#btnZoom { position: absolute; right: 8px; top: 8px; z-index: 2; padding: 4px 10px; font-size: 13px; opacity: .85; }
 #stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; background: #000; }
 #hold { position: absolute; inset: 0; width: 100%; height: 100%; display: none; pointer-events: none; background: #000; }
 #canvas {
@@ -309,9 +311,12 @@ input[type=file] { display: none; }
 
   <div id="stageWrap">
     <div id="stage">
-      <video id="video" playsinline></video>
-      <canvas id="hold"></canvas>
-      <canvas id="canvas"></canvas>
+      <div id="zoom">
+        <video id="video" playsinline></video>
+        <canvas id="hold"></canvas>
+        <canvas id="canvas"></canvas>
+      </div>
+      <button id="btnZoom" hidden title="等倍に戻す（2本指のダブルタップでも戻せます）">100%</button>
       <div id="empty">動画か音声ファイルをここにドラッグするか、「開く」を押してください</div>
     </div>
   </div>
@@ -418,6 +423,10 @@ input[type=file] { display: none; }
       <select id="selInput"><option value="auto">自動（ペンを使うと指は無視）</option><option value="pen">ペンだけ</option><option value="any">指もOK</option></select>
     </div>
     <div class="setRow">
+      <label for="chkZoom">ピンチでズーム<small>2本指でつまむと、動画とメモだけを拡大します（PCは Ctrl+ホイール）。手のひらで拡大してしまう時はオフ</small></label>
+      <input type="checkbox" id="chkZoom">
+    </div>
+    <div class="setRow">
       <label for="chkHold">メモのコマで静止<small>再生と音声はそのまま。画だけを、メモのコマで次のメモまで止めます</small><small id="holdNote" hidden>いまは自動で切れています（メモの表示を「次のメモまで」にすると使えます）</small></label>
       <input type="checkbox" id="chkHold">
     </div>
@@ -519,6 +528,7 @@ const S = {
   step: 5,              // 秒送りの幅（秒）
   inputMode: 'auto',    // 'auto' ペンを使うと指は無視 / 'pen' ペンだけ / 'any' 指もOK
   penSeen: false, palmHint: false,
+  pinchZoom: true,      // 2本指のつまみ（PCは Ctrl+ホイール）で、動画とメモを拡大する
   opacity: 100,         // メモの透明度（0〜100%）
   palette: 'wheel',     // 'wheel' | 'square' | 'swatch'
   colorFormat: 'HEX',   // 'HEX' | 'RGB' | 'HSL' | 'HSB'
@@ -667,11 +677,86 @@ function fit() {
   if (h > ah) { h = ah; w = h * S.aspect; }
   w = Math.max(80, Math.floor(w)); h = Math.max(45, Math.floor(h));
   stage.style.width = w + 'px'; stage.style.height = h + 'px';
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
-  render(); layoutTimeline();
+  applyZoom(); setRes(); layoutTimeline();
 }
 new ResizeObserver(fit).observe(wrap);
+
+/* ================= 拡大（2本指のつまみ、Ctrl+ホイール） =================
+   #zoom（動画・静止したコマ・メモの層）だけを拡大する。#stage の外へは、はみ出さない。
+   線の座標は、拡大後の表示位置（getBoundingClientRect）から計算するので、拡大してもずれない */
+const zoomBox = $('zoom'), btnZoom = $('btnZoom');
+const Z = { k: 1, x: 0, y: 0 };              // 倍率と、#stage の左上からのずらし（px）
+const ZOOM_MAX = 4;
+const touches = new Map();                    // 触れている指: pointerId → [clientX, clientY]
+let pinch = null, lastTwoTap = 0, resTimer;
+function applyZoom() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  Z.k = clamp(Z.k, 1, ZOOM_MAX);
+  Z.x = clamp(Z.x, w - w * Z.k, 0); Z.y = clamp(Z.y, h - h * Z.k, 0);
+  zoomBox.style.transform = Z.k === 1 ? '' : `translate(${Z.x}px, ${Z.y}px) scale(${Z.k})`;
+  btnZoom.hidden = Z.k === 1;
+  clearTimeout(resTimer); resTimer = setTimeout(setRes, 150);   // 拡大が落ち着いてから、線を細かく描き直す
+}
+// 画面上の点 (cx, cy) を動かさずに、倍率を k にする
+function zoomAt(k, cx, cy) {
+  const r = stage.getBoundingClientRect(), px = cx - r.left, py = cy - r.top, nk = clamp(k, 1, ZOOM_MAX);
+  Z.x = px - (px - Z.x) * nk / Z.k; Z.y = py - (py - Z.y) * nk / Z.k; Z.k = nk;
+  applyZoom();
+}
+function zoomReset() { Z.k = 1; Z.x = 0; Z.y = 0; applyZoom(); }
+btnZoom.onclick = zoomReset;
+// メモの層の解像度。拡大した分だけ細かくする（大きすぎるキャンバスは iOS で描けないので、約1600万画素まで）
+function setRes() {
+  const w = stage.clientWidth, h = stage.clientHeight, dpr = window.devicePixelRatio || 1;
+  const s = dpr * Math.max(1, Math.min(Z.k, Math.sqrt(16e6 / (w * h * dpr * dpr))));
+  const cw = Math.round(w * s), ch = Math.round(h * s);
+  if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
+  render();
+}
+const twoFingers = () => { const [a, b] = [...touches.values()]; return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, Math.hypot(a[0] - b[0], a[1] - b[1])]; };
+function cancelDraw() {                       // 指で描き始めた線を、無かったことにする（2本目の指が触れた時）
+  const d = drawing; drawing = null;
+  if (d.kind === 'pen' || d.snapped) restore(S.undo.pop());
+}
+// 下の描画より先に登録する（2本目の指は、描画に渡さない）
+canvas.addEventListener('pointerdown', (e) => {
+  if (e.pointerType !== 'touch' || !S.pinchZoom || !hasMedia()) return;
+  if (drawing && drawing.ptype !== 'touch') return;          // ペンで描いている間の指は、今までどおり無視
+  touches.set(e.pointerId, [e.clientX, e.clientY]);
+  if (touches.size < 2) return;
+  e.stopImmediatePropagation();
+  if (pinch) return;
+  if (drawing) cancelDraw();
+  const [mx, my, d] = twoFingers();
+  pinch = { k: Z.k, x: Z.x, y: Z.y, mx, my, d: d || 1, t: performance.now(), moved: false };
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!touches.has(e.pointerId)) return;
+  touches.set(e.pointerId, [e.clientX, e.clientY]);
+  if (!pinch) return;
+  e.stopImmediatePropagation();
+  const [mx, my, d] = twoFingers(), r = stage.getBoundingClientRect();
+  // つまみ始めに指の間にあった点を、いまの指の間に持ってくる
+  const px = (pinch.mx - r.left - pinch.x) / pinch.k, py = (pinch.my - r.top - pinch.y) / pinch.k;
+  Z.k = clamp(pinch.k * d / pinch.d, 1, ZOOM_MAX); Z.x = mx - r.left - px * Z.k; Z.y = my - r.top - py * Z.k;
+  if (Math.abs(d - pinch.d) > 12 || Math.hypot(mx - pinch.mx, my - pinch.my) > 12) pinch.moved = true;
+  applyZoom();
+});
+function touchUp(e) {
+  if (!touches.delete(e.pointerId) || !pinch || touches.size >= 2) return;
+  if (!pinch.moved && performance.now() - pinch.t < 300) {   // 2本指で軽く2回たたくと、等倍に戻す
+    if (performance.now() - lastTwoTap < 400) { zoomReset(); lastTwoTap = 0; } else lastTwoTap = performance.now();
+  }
+  pinch = null;
+}
+canvas.addEventListener('pointerup', touchUp);
+canvas.addEventListener('pointercancel', touchUp);
+// PC: Ctrl+ホイール（トラックパッドのつまみも、これで届く）で拡大。拡大中は、ホイールで動かす
+stage.addEventListener('wheel', (e) => {
+  if (!S.pinchZoom || !hasMedia()) return;
+  if (e.ctrlKey) { e.preventDefault(); zoomAt(Z.k * Math.exp(-clamp(e.deltaY, -50, 50) * 0.01), e.clientX, e.clientY); }
+  else if (Z.k > 1) { e.preventDefault(); Z.x -= e.deltaX; Z.y -= e.deltaY; applyZoom(); }
+}, { passive: false });
 
 /* ================= メモのコマで静止 =================
    再生と音声はそのまま続ける。画だけを、メモの時刻のコマで、次のメモの時刻まで止める。
@@ -806,12 +891,12 @@ canvas.addEventListener('pointerdown', (e) => {
     pushRecent(S.color);
     memo.strokes.push(stroke);
     S.selId = memo.id;
-    drawing = { kind: 'pen', stroke, memo, pid: e.pointerId, last: performance.now() };
+    drawing = { kind: 'pen', stroke, memo, pid: e.pointerId, ptype: e.pointerType, last: performance.now() };
     render();
   } else {
     const memo = shownMemo();
     if (!memo) return;
-    drawing = { kind: 'erase', memo, snapped: false, pid: e.pointerId, last: performance.now() };
+    drawing = { kind: 'erase', memo, snapped: false, pid: e.pointerId, ptype: e.pointerType, last: performance.now() };
     eraseStep(pt);
   }
 });
@@ -1187,7 +1272,8 @@ function loadPrefs() {
     if (p.afterLastSecs >= 0 && p.afterLastSecs <= 600) S.afterLastSecs = +p.afterLastSecs;
     if (typeof p.keepFile === 'boolean') S.keepFile = p.keepFile;
     if (typeof p.uploadFile === 'boolean') S.uploadFile = p.uploadFile;
-    if (p.penSeen === true) S.penSeen = true;                          // この端末で、ペンを使ったことがある（次から、最初の1回から、指を無視する）
+    if (typeof p.zoom === 'boolean') S.pinchZoom = p.zoom;
+    if (p.penSeen === true) S.penSeen = true;                         // この端末で、ペンを使ったことがある（次から、最初の1回から、指を無視する）
     if (p.displaySecs >= 0.1 && p.displaySecs <= 600) S.displaySecs = +p.displaySecs;
     if (p.color && hexToRgb(p.color)) { S.color = toHex(hexToRgb(p.color)); S.hsv = rgb2hsv(...hexToRgb(S.color)); }
     if (Array.isArray(p.recent)) S.recent = p.recent.filter((c) => hexToRgb(c)).slice(0, 8);
@@ -1195,7 +1281,7 @@ function loadPrefs() {
 }
 function savePrefs() {
   try {
-    localStorage.setItem('vcon:prefs', JSON.stringify({ step: S.step, input: S.inputMode, opacity: S.opacity, palette: S.palette, format: S.colorFormat, sort: S.sort, hold: S.hold, display: S.display, displaySecs: S.displaySecs, afterLast: S.afterLast, afterLastSecs: S.afterLastSecs, keepFile: S.keepFile, uploadFile: S.uploadFile, penSeen: S.penSeen, color: S.color, recent: S.recent }));
+    localStorage.setItem('vcon:prefs', JSON.stringify({ step: S.step, input: S.inputMode, opacity: S.opacity, palette: S.palette, format: S.colorFormat, sort: S.sort, hold: S.hold, display: S.display, displaySecs: S.displaySecs, afterLast: S.afterLast, afterLastSecs: S.afterLastSecs, keepFile: S.keepFile, uploadFile: S.uploadFile, zoom: S.pinchZoom, penSeen: S.penSeen, color: S.color, recent: S.recent }));
   } catch (_) { /* 保存できなくても動く */ }
 }
 function applyPrefsToUI() {
@@ -1203,7 +1289,7 @@ function applyPrefsToUI() {
   $('selPalette').value = S.palette; $('selFormat').value = S.colorFormat; $('selInput').value = S.inputMode; $('selSort').value = S.sort;
   $('selDisplay').value = S.display; $('numSecs').value = String(S.displaySecs); $('rowSecs').hidden = S.display !== 'secs';
   $('selAfterLast').value = S.afterLast; $('numAfterSecs').value = String(S.afterLastSecs); $('rowAfterSecs').hidden = S.afterLast !== 'play';
-  $('chkKeep').checked = S.keepFile; $('chkUpload').checked = S.uploadFile; $('rowUpload').hidden = !SERVER;
+  $('chkKeep').checked = S.keepFile; $('chkUpload').checked = S.uploadFile; $('chkZoom').checked = S.pinchZoom; $('rowUpload').hidden = !SERVER;
   $('afterChips').querySelectorAll('button').forEach((b) => b.classList.toggle('on', +b.dataset.v === S.afterLastSecs));
   syncSteps(); paintColorUI(); syncButtons();
   $('stepChips').querySelectorAll('button').forEach((b) => b.classList.toggle('on', +b.dataset.v === S.step));
@@ -1242,6 +1328,7 @@ $('rngOpacity').onchange = savePrefs;
 $('selPalette').onchange = (e) => { S.palette = e.target.value; paintColorUI(); savePrefs(); };
 $('selFormat').onchange = (e) => { S.colorFormat = e.target.value; paintColorUI(); savePrefs(); };
 $('selInput').onchange = (e) => { S.inputMode = e.target.value; savePrefs(); };
+$('chkZoom').onchange = (e) => { S.pinchZoom = e.target.checked; if (!S.pinchZoom) zoomReset(); savePrefs(); };
 $('chkHold').onchange = (e) => setHold(e.target.checked);
 $('btnSettings').onclick = openSettings;
 $('btnHomeSettings').onclick = openSettings;
@@ -1387,6 +1474,7 @@ function openMedia(file, pid) {
     S.memos = []; S.nextId = 1; S.undo = []; S.redo = []; S.duration = 0;
     S.savedAt = 0; S.dirty = false; clearTimeout(syncTimer);    // 前のファイルの送信待ちを、新しいファイルへ持ち越さない
     frames.clear(); framePending.clear(); holdId = null; hold.style.display = 'none'; holdOn = false;
+    zoomReset();                                                // 開き直したら、等倍に戻す
     video.onloadedmetadata = () => {
       S.duration = video.duration;
       setSpeed(1);
