@@ -1306,6 +1306,13 @@ document.addEventListener('keydown', (e) => {
 
 /* ================= ファイル ================= */
 const MEDIA_EXT = /\.(mp4|m4v|mov|webm|mp3|wav|m4a|aac|ogg|flac)$/i;
+const MEDIA_TYPES = { mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac', ogg: 'audio/ogg', flac: 'audio/flac' };
+// 型が空のファイルは、名前の拡張子から補う。iPhone・iPad の Safari は、型の無いファイルの中身を見分けず、再生しない（サーバーは .wav を、型なしで返す）
+function withMediaType(file) {
+  if (/^(video|audio)\//.test(file.type)) return file;
+  const t = MEDIA_TYPES[(file.name.match(/\.(\w+)$/) || [])[1]?.toLowerCase()];
+  return t ? new File([file], file.name, { type: t }) : file;
+}
 let mediaUrl = null;
 // プロジェクトの識別（S.pid）: 既定は「ファイル名|サイズ」。メモの控え・サーバーのメモ・残したファイルは、すべてこれを鍵にする。
 // 実際に開いているファイルの名前・サイズ（S.mediaName・S.mediaSize）とは、別に持つ（一覧から選んで開いた時は、名前やサイズが違っても、そのプロジェクトに結びつけるため）
@@ -1362,6 +1369,7 @@ function flushPending() {
   fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body, keepalive: body.length < 60000 }).catch(() => { /* 控えは端末に残る。次に開いた時に送る */ });
 }
 function openMedia(file, pid) {
+  file = withMediaType(file);
   flushPending();
   return new Promise((resolve) => {
     if (mediaUrl) URL.revokeObjectURL(mediaUrl);
@@ -1381,7 +1389,7 @@ function openMedia(file, pid) {
       frameVideo.src = mediaUrl; frameVideo.load();
       fit(); syncButtons(); resolve();
     };
-    video.onerror = () => { toast('このファイルは再生できません（形式を確認してください）'); resolve(); };
+    video.onerror = () => { toast(`このファイルは再生できません（形式を確認してください。型: ${file.type || 'なし'}、コード: ${video.error ? video.error.code : '?'}）`); resolve(); };
     video.src = mediaUrl; video.load();
   });
 }
